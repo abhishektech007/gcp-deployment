@@ -1,0 +1,26 @@
+# GCP Deployment — Ignore Rules
+# =====================================================================
+
+# Environment files (contain secrets)
+.env
+.env.*
+!.env.example
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Node
+node_modules/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -1,0 +1,92 @@
+# =============================================================================
+# FILE: .dockerignore
+# PURPOSE: Optimize Docker Build Context & Prevent Sensitive Data Leaks
+# =============================================================================
+#
+# ARCHITECTURAL RATIONALE:
+#   When `docker build` runs, the entire local directory context is serialized
+#   and transmitted to the Docker daemon. Excluding non-essential assets achieves:
+#     1. Build Speed: Prevents transmitting hundreds of megabytes of local data.
+#     2. Image Layer Caching: Ensures changes to tests, docs, or local caches
+#        do not invalidate Docker layer cache hits.
+#     3. Zero Secret Leakage: Prevents local .env files, private credentials, and
+#        debug logs from accidentally baking into production container layers.
+#     4. Cross-Platform Stability: Prevents local host-compiled binary artifacts
+#        (e.g., node_modules or Python venvs compiled on Windows/macOS) from
+#        polluting the Linux Alpine/Debian container environment.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. Version Control Metadata
+# Prevents repository history (.git) from leaking into the container filesystem.
+# -----------------------------------------------------------------------------
+.git
+.gitignore
+.gitattributes
+
+# -----------------------------------------------------------------------------
+# 2. Host-Specific Dependencies & Virtual Environments
+# Dependencies must be resolved and compiled cleanly inside the target Linux container.
+# -----------------------------------------------------------------------------
+node_modules
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+venv
+ENV/
+env/
+
+# -----------------------------------------------------------------------------
+# 3. Local Environment Variables & Secrets
+# CRITICAL SECURITY: Production secrets must be injected at runtime via
+# Google Cloud Secret Manager or Cloud Run Environment Variables.
+# -----------------------------------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+*.cert
+*.crt
+id_rsa*
+service-account*.json
+credentials.json
+
+# -----------------------------------------------------------------------------
+# 4. Testing Artifacts, Code Coverage & Linting Configurations
+# Testing suites and coverage reports are unnecessary inside production runtime layers.
+# -----------------------------------------------------------------------------
+coverage
+.nyc_output
+*.test.js
+*.spec.js
+*.test.ts
+*.spec.ts
+jest.config.*
+.eslintrc*
+.prettierrc*
+tsconfig.tsbuildinfo
+
+# -----------------------------------------------------------------------------
+# 5. Developer IDE & Operating System Artifacts
+# Cleanly strips host workstation clutter.
+# -----------------------------------------------------------------------------
+.vscode
+.idea
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# -----------------------------------------------------------------------------
+# 6. Documentation & Build Scaffolding
+# Keeps the build context restricted strictly to deployable source files.
+# -----------------------------------------------------------------------------
+*.md
+LICENSE
+docs/
+docker-compose*.yml
+Dockerfile*
+.dockerignore

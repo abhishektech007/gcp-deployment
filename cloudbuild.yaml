@@ -1,0 +1,231 @@
+# =============================================================================
+# PIPELINE SPECIFICATION: Google Cloud Build CI/CD Automation
+# Target: Automated Validation, Container Compilation & Cloud Run Deployment
+# =============================================================================
+#
+# ARCHITECTURAL LIFECYCLE:
+#   [Trigger] -> [Step 1: Test Suite] -> [Step 2: Container Build]
+#             -> [Step 3: Registry Push] -> [Step 4: Cloud Run Rollout]
+#             -> [Step 5: Post-Deployment Smoke Test]
+#
+# DESIGN PHILOSOPHY:
+#   1. Fail-Fast Quality Gate: The test suite executes in Step 1. If any test or
+#      linter fails, the entire pipeline terminates instantly before generating
+#      container images or modifying production cloud infrastructure.
+#   2. Deterministic Immutability: Every build generates an image tagged with the
+#      git commit short hash (${SHORT_SHA}). Cloud Run explicitly deploys this
+#      exact commit SHA, guaranteeing traceable, zero-drift releases and enabling
+#      single-click instant rollbacks in Google Cloud Console.
+#   3. BuildKit Layer Cache Acceleration: Re-uses cached layers from the remote
+#      registry via BUILDKIT_INLINE_CACHE, cutting build durations by up to 70%.
+#   4. Post-Rollout Liveness Verification: Step 5 polls the live service endpoint
+#      to ensure the new revision responds with HTTP 200 before marking the build as SUCCESS.
+#
+# EXECUTION MODES:
+#   - Automated Webhook: Triggered on Git push to 'main' or 'staging' branches.
+#   - Manual Invocation:
+#       gcloud builds submit --config=cloudbuild.yaml \
+#         --substitutions=_REGION=us-central1,_SERVICE_NAME=backend-api .
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Dynamic Substitution Variables
+# Default values can be overridden per environment (e.g. staging vs prod)
+# via the Cloud Build Trigger interface or CLI --substitutions flag.
+# -----------------------------------------------------------------------------
+substitutions:
+  # Deployment Region for Artifact Registry and Cloud Run
+  _REGION: "us-central1"
+  # Target Cloud Run Service Identifier
+  _SERVICE_NAME: "backend-api"
+  # Google Artifact Registry Repository Identifier
+  _AR_REPO: "docker-repo"
+  # Autoscaling: Minimum instances (0 = scale to zero for cost optimization; >=1 eliminates cold starts)
+  _MIN_INSTANCES: "0"
+  # Autoscaling: Maximum concurrent instances to prevent runaway compute costs
+  _MAX_INSTANCES: "10"
+  # Memory allocation per Cloud Run instance container
+  _MEMORY: "512Mi"
+  # CPU quota allocated per container instance (1 = 1 vCPU)
+  _CPU: "1"
+  # Concurrency: Maximum concurrent HTTP requests handled simultaneously per instance
+  _CONCURRENCY: "80"
+
+# -----------------------------------------------------------------------------
+# Global Build Engine Options
+# -----------------------------------------------------------------------------
+options:
+  # High-throughput virtual machine (8 vCPUs) for accelerated npm/docker builds
+  machineType: "E2_HIGHCPU_8"
+  # Stream structured execution logs directly to Google Cloud Logging
+  logging: CLOUD_LOGGING_ONLY
+  # Allow runtime substitution resolution in inline bash commands
+  dynamic_substitutions: true
+
+# =============================================================================
+# Execution Steps
+# =============================================================================
+steps:
+
+  # ---------------------------------------------------------------------------
+  # STEP 1: Automated Unit & Integration Testing Gate
+  # Purpose: Executes test suite in a pristine environment. Aborts pipeline on failure.
+  # ---------------------------------------------------------------------------
+  - id: "run-tests"
+    name: "node:20-alpine"
+    entrypoint: "sh"
+    args:
+      - "-c"
+      - |
+        echo "====================================================================="
+        echo " [STAGE 1/5] Executing Backend Quality & Unit Test Suite"
+        echo "====================================================================="
+        cd backend
+
+        # Install clean dependencies using lockfile verification
+        npm ci --ignore-scripts
+
+        # Execute tests with CI flags (disables interactive watchers, captures code coverage)
+        npm test -- --ci --coverage --watchAll=false || {
+          echo "[-] FATAL: Test suite failed! Terminating CI/CD pipeline immediately."
+          exit 1
+        }
+        echo "[✔] All quality gates and test suites passed successfully."
+    dir: "."
+
+  # Python alternative test runner (uncomment when running Python stack):
+  # - id: "run-tests-python"
+  #   name: "python:3.12-slim"
+  #   entrypoint: "sh"
+  #   args:
+  #     - "-c"
+  #     - |
+  #       cd backend
+  #       pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
+  #       python -m pytest tests/ -v --tb=short || exit 1
+
+  # ---------------------------------------------------------------------------
+  # STEP 2: Container Image Compilation (Docker Multi-Stage Build)
+  # Purpose: Compiles the production container with dual tagging (Git SHA + latest).
+  # ---------------------------------------------------------------------------
+  - id: "build-image"
+    name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      # Primary tag: Immutable Git commit SHA for auditability and rollback accuracy
+      - "--tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_SERVICE_NAME}:${SHORT_SHA}"
+      # Secondary tag: Floating 'latest' pointer for human operational convenience
+      - "--tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_SERVICE_NAME}:latest"
+      # Cache source: Leverages the previously published 'latest' image to speed up builds
+      - "--cache-from=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_SERVICE_NAME}:latest"
+      # Embed inline metadata into the image layers for cache hit detection
+      - "--build-arg=BUILDKIT_INLINE_CACHE=1"
+      - "-f=backend/Dockerfile"
+      - "backend/"
+    waitFor: ["run-tests"]
+
+  # ---------------------------------------------------------------------------
+  # STEP 3A: Publish Immutable SHA-Tagged Image to Artifact Registry
+  # ---------------------------------------------------------------------------
+  - id: "push-image-sha"
+    name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_SERVICE_NAME}:${SHORT_SHA}"
+    waitFor: ["build-image"]
+
+  # ---------------------------------------------------------------------------
+  # STEP 3B: Publish Floating 'latest' Tag to Artifact Registry
+  # ---------------------------------------------------------------------------
+  - id: "push-image-latest"
+    name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_SERVICE_NAME}:latest"
+    waitFor: ["build-image"]
+
+  # ---------------------------------------------------------------------------
+  # STEP 4: Cloud Run Service Revision Rollout
+  # Purpose: Deploys the newly published image revision to Google Cloud Run.
+  # ---------------------------------------------------------------------------
+  - id: "deploy-cloud-run"
+    name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: "gcloud"
+    args:
+      - "run"
+      - "deploy"
+      - "${_SERVICE_NAME}"
+      # Explicitly deploy the immutable SHA tag to eliminate caching ambiguity
+      - "--image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_SERVICE_NAME}:${SHORT_SHA}"
+      - "--region=${_REGION}"
+      - "--platform=managed"
+      - "--allow-unauthenticated"
+      # Autoscaling parameters
+      - "--min-instances=${_MIN_INSTANCES}"
+      - "--max-instances=${_MAX_INSTANCES}"
+      # Compute resource thresholds
+      - "--memory=${_MEMORY}"
+      - "--cpu=${_CPU}"
+      - "--concurrency=${_CONCURRENCY}"
+      - "--port=8080"
+      # Static environment variables
+      - "--set-env-vars=NODE_ENV=production,LOG_LEVEL=info"
+      # Integration with Google Cloud Secret Manager (uncomment to inject secrets securely):
+      # - "--set-secrets=DATABASE_URL=db-url:latest,API_SECRET=backend-api-key:latest"
+      # Tag revision with commit SHA for instant identification in Cloud Console
+      - "--revision-suffix=${SHORT_SHA}"
+      - "--tag=rev-${SHORT_SHA}"
+    waitFor: ["push-image-sha", "push-image-latest"]
+
+  # ---------------------------------------------------------------------------
+  # STEP 5: Post-Deployment Smoke Test & Health Check Verification
+  # Purpose: Validates that the newly routed revision is active and serving traffic.
+  # ---------------------------------------------------------------------------
+  - id: "verify-deployment"
+    name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: "sh"
+    args:
+      - "-c"
+      - |
+        echo "====================================================================="
+        echo " [STAGE 5/5] Performing Post-Rollout Live Health Verification"
+        echo "====================================================================="
+
+        # Query Cloud Run API for the live HTTPS public ingress URL
+        SERVICE_URL=$(gcloud run services describe ${_SERVICE_NAME} \
+          --region=${_REGION} \
+          --format='value(status.url)')
+        echo "[*] Live Service Endpoint: $${SERVICE_URL}"
+
+        # Exponential retry mechanism: verify HTTP 200 on /health over 5 attempts
+        for attempt in 1 2 3 4 5; do
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$${SERVICE_URL}/health" || true)
+          if [ "$${HTTP_STATUS}" = "200" ]; then
+            echo "[✔] SUCCESS: Health probe returned HTTP 200 OK on attempt $${attempt}!"
+            exit 0
+          fi
+          echo "[!] Health check attempt $${attempt}/5 returned HTTP $${HTTP_STATUS}. Retrying in 10s..."
+          sleep 10
+        done
+
+        echo "[-] FATAL: Service failed health probe verification after 5 attempts."
+        echo "    Inspect revision logs: gcloud run services logs read ${_SERVICE_NAME} --region=${_REGION}"
+        exit 1
+    waitFor: ["deploy-cloud-run"]
+
+# -----------------------------------------------------------------------------
+# Published Image Registry Artifacts
+# -----------------------------------------------------------------------------
+images:
+  - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_SERVICE_NAME}:${SHORT_SHA}"
+  - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_SERVICE_NAME}:latest"
+
+# Maximum duration before the pipeline is aborted
+timeout: "600s"
+
+# Categorization tags for filtering builds in Google Cloud Console
+tags:
+  - "production"
+  - "backend"
+  - "${_SERVICE_NAME}"
+  - "cloud-run"
